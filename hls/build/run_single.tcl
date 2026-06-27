@@ -3,8 +3,8 @@ open_project -reset matmul_single
 add_files matmul_all.cpp
 set_top matmul_top
 open_solution -reset solution1
-set_part xc7z020clg400-1
-create_clock -period 10.0 -name default
+set_part xc7z020clg400-2
+create_clock -period 20.0 -name default
 
 puts "\n======= C 综合 ======="
 csynth_design

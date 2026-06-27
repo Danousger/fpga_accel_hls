@@ -30,7 +30,7 @@ set PROJ_DIR  "./vivado_proj"
 if {[file exists ${PROJ_DIR}]} {
     file delete -force ${PROJ_DIR}
 }
-create_project ${PROJ_NAME} ${PROJ_DIR} -part xc7z020clg400-1
+create_project ${PROJ_NAME} ${PROJ_DIR} -part xc7z020clg400-2
 
 # ---------------------------------------------------------------------------
 # 添加 HLS IP 仓库

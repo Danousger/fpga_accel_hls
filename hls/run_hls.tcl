@@ -5,7 +5,7 @@
 set PROJ_NAME   "matmul_accel"
 set TOP_FN      "matmul_top"
 set CLK_PERIOD  10.0
-set PART        "xc7z020clg400-1"
+set PART        "xc7z020clg400-2"
 
 # 项目放在当前目录, 不 cd
 open_project -reset ${PROJ_NAME}

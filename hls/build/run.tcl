@@ -6,7 +6,7 @@ add_files matmul_top.cpp   -cflags "-IE:/fpga-ai/hls/build"
 add_files -tb matmul_tb.cpp -cflags "-IE:/fpga-ai/hls/build"
 set_top matmul_top
 open_solution -reset solution1
-set_part xc7z020clg400-1
+set_part xc7z020clg400-2
 create_clock -period 10.0 -name default
 
 puts "\n======= C 仿真 ======="

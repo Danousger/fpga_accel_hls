@@ -1,6 +1,6 @@
 // ============================================================================
 // matmul_all.cpp — 定点数矩阵乘法加速器 (单文件版, 综合用)
-// 目标: Zynq-7020 (xc7z020clg400-1), Q8.8 定点, 4 MAC 并行
+// 目标: Zynq-7020 (xc7z020clg400-2), Q8.8 定点, 4 MAC 并行
 // ============================================================================
 
 #include <ap_fixed.h>
@@ -18,7 +18,7 @@ typedef hls::stream<data_t> data_stream;
 #define TILE_M  16
 #define TILE_N  16
 #define TILE_K  16
-#define PARALLEL_N  2
+#define PARALLEL_N  4
 #define MIN(a,b) (((a)<(b))?(a):(b))
 
 // ========================== 核心计算 ==========================
@@ -28,9 +28,9 @@ void matmul_core(
     data_t  B_buf[TILE_K][TILE_N],
     acc_t   C_buf[TILE_M][TILE_N]
 ) {
-    #pragma HLS ARRAY_PARTITION variable=A_buf cyclic factor=2 dim=2
-    #pragma HLS ARRAY_PARTITION variable=B_buf cyclic factor=2 dim=2
-    #pragma HLS ARRAY_PARTITION variable=C_buf cyclic factor=2 dim=2
+    #pragma HLS ARRAY_PARTITION variable=A_buf cyclic factor=4 dim=2
+    #pragma HLS ARRAY_PARTITION variable=B_buf cyclic factor=4 dim=2
+    #pragma HLS ARRAY_PARTITION variable=C_buf cyclic factor=4 dim=2
 
     for (int i = 0; i < TILE_M; i++) {
         for (int j = 0; j < TILE_N; j += PARALLEL_N) {
@@ -70,9 +70,9 @@ void matmul_top(
     data_t B_buf[TILE_K][TILE_N];
     acc_t  C_buf[TILE_M][TILE_N];
 
-    #pragma HLS ARRAY_PARTITION variable=A_buf cyclic factor=2 dim=2
-    #pragma HLS ARRAY_PARTITION variable=B_buf cyclic factor=2 dim=2
-    #pragma HLS ARRAY_PARTITION variable=C_buf cyclic factor=2 dim=2
+    #pragma HLS ARRAY_PARTITION variable=A_buf cyclic factor=4 dim=2
+    #pragma HLS ARRAY_PARTITION variable=B_buf cyclic factor=4 dim=2
+    #pragma HLS ARRAY_PARTITION variable=C_buf cyclic factor=4 dim=2
 
     int M_tiles = (M + 15) / 16;
     int N_tiles = (N + 15) / 16;
