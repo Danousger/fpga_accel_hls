@@ -1,264 +1,295 @@
 #!/usr/bin/env python3
 # ============================================================================
-# pynq_driver.py — Pynq 框架下的定点数矩阵乘法加速器驱动
+# pynq_driver.py — Systolic Array 矩阵乘法加速器 Pynq 驱动
+#
+# 适配:
+#   - Pynq v2.6+ (allocate API; v2.5 用 Xlnk 回退)
+#   - Block Design: 3 个单向 AXI DMA (axi_dma_A/B/C) + matmul_top_0 IP
+#   - HLS 流协议: 每 (m,n) tile 发送全部 A/B k_tile 后接收一次 C_tile
 #
 # 前置条件:
-#   1. Zynq-7020 开发板 (如 Pynq-Z2, ZedBoard, ZC702 等)
-#   2. 已烧录 Pynq 镜像到 SD 卡
-#   3. 将 matmul_accel IP 集成到 Vivado Block Design 并生成 bitstream
-#   4. 将 .bit 和 .hwh 文件上传到开发板
+#   1. Pynq v2.7 镜像 (Ubuntu 20.04) 已烧录 SD 卡
+#   2. design_1_wrapper.bit + design_1.hwh 已传到板子
 #
 # 用法:
-#   python3 pynq_driver.py
+#   from pynq_driver import MatMulAccelerator
+#   accel = MatMulAccelerator("design_1.bit")
+#   C = accel.matmul(A, B)            # 单次计算 + 计时
+#   results = accel.benchmark()       # 多尺寸基准测试
 # ============================================================================
 
 import numpy as np
 import time
-from pynq import Overlay, allocate
-from pynq import Xlnk
-import argparse
+from pynq import Overlay, allocate, MMIO, Clocks
+
+# Pynq v2.5 兼容 (Xlnk); v2.6+ 用 allocate
+try:
+    from pynq import Xlnk
+    _HAS_XLNK = True
+except ImportError:
+    _HAS_XLNK = False
+
+
+def _enable_fclk():
+    """使能 FCLK_CLK0 = 100MHz + AXI 总线时钟。
+
+    Linux clk-fclk-zynq 驱动 claim 了 FCLK 寄存器, 直接写 SLCR 会被忽略。
+    必须用 Pynq Clocks API (走 kernel clock framework) 来使能 FCLK。
+
+    顺序: 先使能 FCLK (PL 时钟), 再使能 AXI 总线时钟, 否则总线无时钟会崩。
+    """
+    # 1) 通过 Pynq Clocks API 设置 FCLK0 = 100MHz (kernel clock framework)
+    if Clocks.fclk0 != 100:
+        Clocks.fclk0 = 100
+        time.sleep(0.2)
+
+    # 2) 使能 AXI 总线时钟 (APER_CLK_CTRL, SLCR+0x138, 无写保护)
+    slcr = MMIO(0xF8000000, 0x1000)
+    aper = slcr.read(0x138)
+    slcr.write(0x138, aper | (1 << 0) | (1 << 4))   # M_AXI_GP0 + S_AXI_HP0
+    time.sleep(0.1)
 
 
 class MatMulAccelerator:
-    """定点数矩阵乘法加速器 (Q8.8 格式) 的 Pynq 驱动"""
+    """Systolic Array 定点矩阵乘法加速器 (Q8.8) 的 Pynq 驱动"""
 
-    # 量化参数: Q8.8
-    Q_SCALE = 256.0       # 2^8
+    Q_SCALE = 256.0
     Q_MIN   = -128.0
-    Q_MAX   = 127.99609375  # (2^15 - 1) / 2^8
+    Q_MAX   = 127.99609375
 
-    # --- Tile 尺寸 (必须与 HLS 中的定义一致!) ---
+    # Tile 尺寸 (必须与 HLS matmul.h 一致)
     TILE_M = 16
     TILE_N = 16
     TILE_K = 16
 
-    def __init__(self, bitfile_path, dma_name='axi_dma_0'):
+    # HLS s_axi_control 寄存器偏移 (从 RTL matmul_top_control_s_axi.v 确认)
+    REG_AP_CTRL = 0x00   # bit0=start, bit1=done, bit2=idle, bit3=ready
+    REG_M        = 0x10
+    REG_N        = 0x18
+    REG_K        = 0x20
+
+    def __init__(self, bitfile_path="design_1.bit"):
         """
-        加载 bitstream 并初始化 DMA。
+        加载 bitstream 并初始化 3 个 DMA + 加速器 IP。
 
         参数:
-            bitfile_path: .bit 文件路径
-            dma_name:     Block Design 中 AXI DMA 的实例名
+            bitfile_path: .bit 文件路径 (.hwh 需同名同目录)
         """
         print(f"[INFO] 加载 bitstream: {bitfile_path}")
         self.overlay = Overlay(bitfile_path)
-        self.dma = getattr(self.overlay, dma_name)
-        print(f"[INFO] DMA 已就绪: {dma_name}")
 
+        # 3 个单向 DMA (与 build_bd_systolic.tcl 中的实例名一致)
+        self.dma_A = self.overlay.axi_dma_A   # MM2S → in_A
+        self.dma_B = self.overlay.axi_dma_B   # MM2S → in_B
+        self.dma_C = self.overlay.axi_dma_C   # S2MM ← out_C
+
+        # HLS IP (Pynq 从 .hwh 自动生成驱动)
+        self.ip = self.overlay.matmul_top_0
+
+        # 手动使能 FCLK_CLK0 + AXI 总线时钟 (Pynq v2.7 可能不应用 PS7 init)
+        _enable_fclk()
+
+        print("[INFO] Overlay 加载完成: 3 DMA + matmul_top_0 + FCLK 已使能")
+
+    # ------------------------------------------------------------------
+    # 量化辅助
+    # ------------------------------------------------------------------
     @staticmethod
     def float_to_fixed(arr_float):
-        """将 float32 numpy 数组转换为 Q8.8 int16"""
-        # 钳位到 Q8.8 范围
-        arr_clamped = np.clip(arr_float, MatMulAccelerator.Q_MIN,
-                              MatMulAccelerator.Q_MAX)
-        # 量化: int16_value = round(float * 256)
-        arr_fixed = np.round(arr_clamped * MatMulAccelerator.Q_SCALE).astype(np.int16)
-        return arr_fixed
+        """float32 → Q8.8 int16"""
+        arr = np.clip(arr_float, MatMulAccelerator.Q_MIN, MatMulAccelerator.Q_MAX)
+        return np.round(arr * MatMulAccelerator.Q_SCALE).astype(np.int16)
 
     @staticmethod
     def fixed_to_float(arr_fixed):
-        """将 Q8.8 int16 numpy 数组转换为 float32"""
+        """Q8.8 int16 → float32"""
         return arr_fixed.astype(np.float32) / MatMulAccelerator.Q_SCALE
 
+    # ------------------------------------------------------------------
+    # 硬件矩阵乘法
+    # ------------------------------------------------------------------
     def matmul(self, A_float, B_float):
         """
         硬件矩阵乘法: C = A × B
 
         参数:
-            A_float: numpy float32 数组, shape (M, K)
-            B_float: numpy float32 数组, shape (K, N)
-
+            A_float: float32 (M, K)
+            B_float: float32 (K, N)
         返回:
-            C_float: numpy float32 数组, shape (M, N)
+            C_float: float32 (M, N)
+            latency_ms: 硬件计算耗时 (毫秒, 含 DMA)
         """
         M, K_in = A_float.shape
-        K, N     = B_float.shape
-        assert K_in == K, f"维度不匹配: A 的列数 {K_in} ≠ B 的行数 {K}"
+        K, N = B_float.shape
+        assert K_in == K, f"维度不匹配: A 列 {K_in} ≠ B 行 {K}"
 
-        print(f"[INFO] 矩阵乘法: ({M}×{K}) × ({K}×{N})")
-
-        # --- 1. 量化 ---
         A_fixed = self.float_to_fixed(A_float)
         B_fixed = self.float_to_fixed(B_float)
+        C_fixed = np.zeros((M, N), dtype=np.int16)
 
-        # C 输出缓冲 (int32, 因为累加结果需要更宽位宽)
-        C_fixed = np.zeros((M, N), dtype=np.int32)
-
-        # --- 2. 计算 tile 数量 ---
         M_tiles = (M + self.TILE_M - 1) // self.TILE_M
         N_tiles = (N + self.TILE_N - 1) // self.TILE_N
         K_tiles = (K + self.TILE_K - 1) // self.TILE_K
 
-        print(f"[INFO] Tile 划分: M×N×K = {M_tiles}×{N_tiles}×{K_tiles}")
+        # DMA buffer (int16, 物理连续; 每个 tile 固定 TILE×TILE 元素)
+        a_buf = allocate(self.TILE_M * self.TILE_K, dtype=np.int16)
+        b_buf = allocate(self.TILE_K * self.TILE_N, dtype=np.int16)
+        c_buf = allocate(self.TILE_M * self.TILE_N, dtype=np.int16)
 
-        # --- 3. 分配 DMA buffer ---
-        xlnk = Xlnk()
+        # 配置加速器 + 启动
+        self.ip.write(self.REG_M, M)
+        self.ip.write(self.REG_N, N)
+        self.ip.write(self.REG_K, K)
+        self.ip.write(self.REG_AP_CTRL, 0x1)   # ap_start
 
-        # A tile buffer: TILE_M × TILE_K int16
-        a_buf = allocate(shape=(self.TILE_M * self.TILE_K,), dtype=np.int16)
-        # B tile buffer: TILE_K × TILE_N int16
-        b_buf = allocate(shape=(self.TILE_K * self.TILE_N,), dtype=np.int16)
-        # C tile buffer: TILE_M × TILE_N int32
-        c_buf = allocate(shape=(self.TILE_M * self.TILE_N,), dtype=np.int32)
+        t0 = time.perf_counter()
 
-        # --- 4. 启动加速器计算 ---
-        start_time = time.time()
+        for mt in range(M_tiles):
+            ms = mt * self.TILE_M
+            ma = min(self.TILE_M, M - ms)
+            for nt in range(N_tiles):
+                ns = nt * self.TILE_N
+                na = min(self.TILE_N, N - ns)
 
-        for m_tile in range(M_tiles):
-            m_start = m_tile * self.TILE_M
-            m_act   = min(self.TILE_M, M - m_start)
+                # 发送全部 k_tile 的 A + B (IP 内部累加 K 维度)
+                for kt in range(K_tiles):
+                    ks = kt * self.TILE_K
+                    ka = min(self.TILE_K, K - ks)
 
-            for n_tile in range(N_tiles):
-                n_start = n_tile * self.TILE_N
-                n_act   = min(self.TILE_N, N - n_start)
+                    # 填充 A tile (零填充边界)
+                    a_tile = np.zeros((self.TILE_M, self.TILE_K), dtype=np.int16)
+                    a_tile[:ma, :ka] = A_fixed[ms:ms+ma, ks:ks+ka]
+                    np.copyto(a_buf, a_tile.reshape(-1))
 
-                # C 的部分和 (在 K 维度累加)
-                c_partial = np.zeros((self.TILE_M, self.TILE_N), dtype=np.int32)
+                    # 填充 B tile
+                    b_tile = np.zeros((self.TILE_K, self.TILE_N), dtype=np.int16)
+                    b_tile[:ka, :na] = B_fixed[ks:ks+ka, ns:ns+na]
+                    np.copyto(b_buf, b_tile.reshape(-1))
 
-                for k_tile in range(K_tiles):
-                    k_start = k_tile * self.TILE_K
-                    k_act   = min(self.TILE_K, K - k_start)
+                    # 并行发送 A + B (两个 MM2S 独立 stream)
+                    self.dma_A.sendchannel.transfer(a_buf)
+                    self.dma_B.sendchannel.transfer(b_buf)
+                    self.dma_A.sendchannel.wait()
+                    self.dma_B.sendchannel.wait()
 
-                    # --- 填充 A tile ---
-                    a_buf_tile = np.zeros((self.TILE_M, self.TILE_K), dtype=np.int16)
-                    a_buf_tile[:m_act, :k_act] = A_fixed[
-                        m_start:m_start + m_act,
-                        k_start:k_start + k_act
-                    ]
-                    np.copyto(a_buf, a_buf_tile.ravel())
+                # 接收 C tile (IP 完成该 (m,n) tile 的全部 K 累加后输出)
+                self.dma_C.recvchannel.transfer(c_buf)
+                self.dma_C.recvchannel.wait()
 
-                    # --- 填充 B tile ---
-                    b_buf_tile = np.zeros((self.TILE_K, self.TILE_N), dtype=np.int16)
-                    b_buf_tile[:k_act, :n_act] = B_fixed[
-                        k_start:k_start + k_act,
-                        n_start:n_start + n_act
-                    ]
-                    np.copyto(b_buf, b_buf_tile.ravel())
+                c_tile = np.array(c_buf).reshape(self.TILE_M, self.TILE_N)
+                C_fixed[ms:ms+ma, ns:ns+na] = c_tile[:ma, :na]
 
-                    # --- DMA 传输: A → PL ---
-                    self.dma.sendchannel.transfer(a_buf)
-                    self.dma.sendchannel.wait()
+        t1 = time.perf_counter()
+        latency_ms = (t1 - t0) * 1000.0
 
-                    # --- DMA 传输: B → PL ---
-                    self.dma.sendchannel.transfer(b_buf)
-                    self.dma.sendchannel.wait()
+        # 等待 ap_done (确保 IP 真正完成)
+        while (self.ip.read(self.REG_AP_CTRL) & 0x2) == 0:
+            pass
 
-                    # --- DMA 传输: PL → C ---
-                    self.dma.recvchannel.transfer(c_buf)
-                    self.dma.recvchannel.wait()
-
-                    # 累加部分和
-                    c_tile = np.array(c_buf).reshape(self.TILE_M, self.TILE_N)
-                    c_partial[:m_act, :n_act] += c_tile[:m_act, :n_act]
-
-                # 写回完整结果
-                C_fixed[m_start:m_start + m_act,
-                        n_start:n_start + n_act] = c_partial[:m_act, :n_act]
-
-        elapsed = time.time() - start_time
-
-        # --- 5. 转回浮点数 ---
-        C_float = self.fixed_to_float(C_fixed)
-
-        # --- 6. 性能统计 ---
-        total_ops = 2 * M * N * K  # 每个 MAC 算 2 次操作
-        gops = total_ops / elapsed / 1e9
-        print(f"[INFO] 耗时: {elapsed*1000:.2f} ms")
-        print(f"[INFO] 吞吐: {gops:.3f} GOPS (理论)")
-        print(f"[INFO] MAC 利用率: {gops / (4 * 0.1):.1%} "
-              f"(4 MAC × 100MHz)")
-
-        # --- 7. 释放 DMA buffer ---
         a_buf.close()
         b_buf.close()
         c_buf.close()
-        xlnk.xlnk_reset()
 
-        return C_float
+        C_float = self.fixed_to_float(C_fixed)
+        return C_float, latency_ms
 
-
-# ============================================================================
-# 测试与验证
-# ============================================================================
-def test_matmul(accel, M, N, K):
-    """测试矩阵乘法并验证正确性"""
-    print(f"\n{'='*60}")
-    print(f"测试: ({M}×{K}) × ({K}×{N})")
-    print(f"{'='*60}")
-
-    # 生成随机测试数据 (限制范围防止溢出)
-    np.random.seed(42)
-    A = (np.random.rand(M, K).astype(np.float32) - 0.5) * 20.0
-    B = (np.random.rand(K, N).astype(np.float32) - 0.5) * 20.0
-
-    # 硬件计算
-    C_hw = accel.matmul(A, B)
-
+    # ------------------------------------------------------------------
     # 软件参考 (numpy)
-    C_sw = np.dot(A, B)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def matmul_sw(A_float, B_float):
+        return np.dot(A_float, B_float)
 
-    # 误差分析
-    abs_err = np.abs(C_hw - C_sw)
-    max_err = np.max(abs_err)
-    mean_err = np.mean(abs_err)
-    rel_err = abs_err / (np.abs(C_sw) + 1e-8)
-    max_rel_err = np.max(rel_err)
+    # ------------------------------------------------------------------
+    # 基准测试: 多尺寸, 多次运行, 返回结构化结果
+    # ------------------------------------------------------------------
+    def benchmark(self, sizes=(16, 32, 48, 64), runs=5, seed=42):
+        """
+        多尺寸基准测试。
 
-    print(f"[验证] 最大绝对误差: {max_err:.6f}")
-    print(f"[验证] 平均绝对误差: {mean_err:.6f}")
-    print(f"[验证] 最大相对误差: {max_rel_err*100:.4f}%")
+        参数:
+            sizes: 矩阵尺寸列表 (M=N=K=size)
+            runs:  每个尺寸重复次数 (取中位数)
+            seed:  随机种子 (可复现)
+        返回:
+            dict: {size: {"latency_ms", "latency_std", "gops",
+                          "max_err", "mean_err", "pass"}}
+        """
+        results = {}
+        np.random.seed(seed)
 
-    # Q8.8 理论精度: 1 LSB = 1/256 ≈ 0.004
-    if max_err < 0.02:
-        print(f"[验证] ✓ 通过 (误差在 Q8.8 精度范围内)")
-    else:
-        print(f"[验证] ✗ 误差超出预期, 请检查!")
+        for size in sizes:
+            M = N = K = size
+            # 数据范围确保 K 次累加不饱和 (K × scale² < 128)
+            scale = min(8.0, 8.0 / (size ** 0.5))
+            A = (np.random.rand(M, K).astype(np.float32) - 0.5) * 2 * scale
+            B = (np.random.rand(K, N).astype(np.float32) - 0.5) * 2 * scale
 
-    return max_err
+            C_sw = self.matmul_sw(A, B)
+            latencies = []
+            max_errs = []
+            for r in range(runs):
+                C_hw, lat = self.matmul(A, B)
+                latencies.append(lat)
+                err = np.abs(C_hw - C_sw)
+                max_errs.append(float(err.max()))
+
+            latencies = np.array(latencies)
+            med = float(np.median(latencies))
+            std = float(np.std(latencies))
+            total_ops = 2 * M * N * K
+            gops = total_ops / (med / 1000.0) / 1e9
+            max_err = float(np.max(max_errs))
+            mean_err = float(np.mean([
+                np.abs(self.matmul(A, B)[0] - C_sw).mean()
+                for _ in range(2)
+            ]))
+
+            results[size] = {
+                "latency_ms": med,
+                "latency_std": std,
+                "gops": gops,
+                "max_err": max_err,
+                "mean_err": mean_err,
+                "pass": max_err < 0.03,
+                "raw_latencies": latencies.tolist(),
+            }
+            status = "✓" if max_err < 0.03 else "✗"
+            print(f"  [{status}] {size}×{size}×{size}: "
+                  f"{med:.2f}±{std:.2f} ms, {gops:.2f} GOPS, "
+                  f"max_err={max_err:.4f}")
+
+        return results
 
 
+# ============================================================================
+# 命令行自检
+# ============================================================================
 def main():
-    parser = argparse.ArgumentParser(
-        description='定点数矩阵乘法加速器 (Q8.8) Pynq 驱动')
-    parser.add_argument('--bit', default='design_1.bit',
-                        help='Bitstream 文件路径')
-    parser.add_argument('--dma', default='axi_dma_0',
-                        help='AXI DMA 实例名称')
-    parser.add_argument('--test-only', action='store_true',
-                        help='只做自检 (需要开发板连接)')
+    import argparse
+    parser = argparse.ArgumentParser(description="Systolic matmul Pynq 驱动")
+    parser.add_argument("--bit", default="design_1.bit", help="Bitstream 路径")
+    parser.add_argument("--bench", action="store_true", help="运行基准测试")
     args = parser.parse_args()
 
-    print("╔══════════════════════════════════════════╗")
-    print("║  FPGA 矩阵乘法加速器 — Pynq 驱动 v1.0   ║")
-    print("║  定点格式: Q8.8, Tile: 16×16×16         ║")
-    print("╚══════════════════════════════════════════╝")
+    accel = MatMulAccelerator(args.bit)
 
-    try:
-        accel = MatMulAccelerator(args.bit, args.dma)
-
-        # 测试 1: 小矩阵
-        test_matmul(accel, 16, 16, 16)
-
-        # 测试 2: 中等矩阵
-        test_matmul(accel, 48, 48, 48)
-
-        # 测试 3: 非对齐
-        test_matmul(accel, 13, 17, 11)
-
-        # 测试 4: 矩形矩阵
-        test_matmul(accel, 8, 32, 16)
-
-        print(f"\n{'='*60}")
-        print("全部测试完成!")
-        print(f"{'='*60}")
-
-    except Exception as e:
-        print(f"[错误] {e}")
-        print("\n请确认:")
-        print("  1. 开发板已连接并运行 Pynq")
-        print(f"  2. Bitstream 文件 '{args.bit}' 存在")
-        print("  3. Block Design 中 DMA 实例名正确")
+    if args.bench:
+        print("\n=== 基准测试 ===")
+        results = accel.benchmark()
+        print("\n=== 汇总 ===")
+        for size, r in results.items():
+            print(f"  {size}×{size}: {r['latency_ms']:.2f} ms, "
+                  f"{r['gops']:.2f} GOPS, {'PASS' if r['pass'] else 'FAIL'}")
+    else:
+        A = (np.random.rand(16, 16).astype(np.float32) - 0.5) * 4
+        B = (np.random.rand(16, 16).astype(np.float32) - 0.5) * 4
+        C_hw, lat = accel.matmul(A, B)
+        C_sw = np.dot(A, B)
+        err = np.abs(C_hw - C_sw).max()
+        print(f"16×16: {lat:.2f} ms, max_err={err:.4f}, "
+              f"{'PASS' if err < 0.03 else 'FAIL'}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
