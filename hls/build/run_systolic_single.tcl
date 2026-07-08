@@ -13,8 +13,8 @@ puts "\n======= C 综合 ======="
 csynth_design
 
 puts "\n======= 导出 IP ======="
-catch { export_design -format ip_catalog -vendor "fpga-ai" -version "1.0" } err
-puts "IP export result: $err"
+export_design -format ip_catalog -vendor "fpga-ai" -version "1.0"
+puts "\[INFO\] IP 导出成功!"
 puts "RTL 文件: solution1/syn/verilog/ 和 solution1/syn/vhdl/"
 puts "\n======= 完成! ======="
 exit

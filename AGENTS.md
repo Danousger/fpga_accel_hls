@@ -67,11 +67,17 @@ Also: `hls/build/run.tcl` hardcodes an absolute include path
 
 ## Known toolchain bugs
 
-- **Vivado 2020.2 IP packager bug**: `export_design -format ip_catalog` fails
-  with `bad lexical cast: core_revision` (date stamp → int32 overflow).
-  `run_single.tcl` wraps the call in `catch` to tolerate it. Use the generated
-  RTL directly (`solution1/syn/verilog/matmul_top.v` / `.../vhdl/matmul_top.vhd`)
-  via Vivado `add_files`, not the IP catalog.
+- **Vivado 2020.2 IP packager Y2K22 bug** (FIXED): `export_design -format
+  ip_catalog` failed with `bad lexical cast: core_revision` (date stamp →
+  int32 overflow after 2022-01-01). Fixed by applying the official Xilinx
+  **y2k22 patch**: run `python.exe y2k22_patch/patch.py` from the
+  `E:\xilinx` install root (NOT the patch directory — the script uses
+  `os.getcwd()` as install root). Patch copies `automg_patch_20220104.tcl`
+  into `Vitis_HLS/2020.2/common/scripts/` and `Vivado/2020.2/common/scripts/`.
+  After patching, `export_design` works and produces `export.zip`.
+  `build_bd_systolic.tcl` still uses RTL-direct (`create_bd_cell -type module
+  -reference`) which works with or without the patch, so patching is optional
+  for the systolic flow but required if you want IP catalog integration.
 - **Block Design** — two scripts, both RTL-direct (neither uses IP catalog):
   - `vivado/build_bd.tcl` — original, expects IP at
     `../hls/proj/matmul_accel/solution1/impl/ip`; **broken** by the IP packager

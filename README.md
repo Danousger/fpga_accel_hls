@@ -9,7 +9,7 @@
 | C 仿真 (5 用例, 7133 元素) | ✅ 全部通过, 最大误差 0.025 (6 LSB) |
 | C 综合 (RTL 生成) | ✅ Verilog + VHDL |
 | 时序收敛 @100MHz | ✅ 原版 N=2 (Fmax=143MHz) + 脉动阵列 (Fmax=152MHz) |
-| IP 导出 | ⚠️ Vivado 2020.2 IP packager bug, 用 RTL 直接集成 (已绕过) |
+| IP 导出 | ✅ Y2K22 补丁已应用, `export_design` 正常生成 export.zip |
 | MAC 并行度实验 | ✅ N=4 可行但需降频, 净吞吐未改善 |
 | **Systolic Array 架构** | ✅ **II=1, 16 MAC/cycle, Fmax=152MHz** |
 | Vivado Block Design 集成 | ✅ 时序收敛 WNS=+1.24ns @100MHz, bitstream 已生成 |
@@ -229,10 +229,11 @@ for m_tile in 0..M_tiles-1:
 内层 `k` 循环 `C[i][j] += A×B` 存在真正的 RAW 依赖。HLS 推断 II=24。
 **已解决**: Systolic Array 用寄存器累加器消除依赖, 实现 II=1。
 
-### 2. Vivado 2020.2 IP packager bug
+### 2. Vivado 2020.2 IP packager Y2K22 bug (已修复)
 
-`export_design -format ip_catalog` 报 `bad lexical cast: core_revision` (日期戳 → int32 溢出)。
-**已绕过**: `build_bd_systolic.tcl` 用 `create_bd_cell -type module -reference` 直接例化 RTL。
+`export_design -format ip_catalog` 报 `bad lexical cast: core_revision` (日期戳 → int32 溢出, 2022 年后触发)。
+**已修复**: 应用 Xilinx 官方 y2k22 补丁 (`y2k22_patch/patch.py`, 从 `E:\xilinx` 根目录运行)。
+修复后 `export_design` 正常生成 `export.zip`。`build_bd_systolic.tcl` 的 RTL-direct 方式不依赖此补丁。
 
 ### 3. Vitis HLS 2020.2 clang-tidy 限制
 
