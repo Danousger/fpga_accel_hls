@@ -51,11 +51,12 @@ set zynq [create_bd_cell -type ip -vlnv xilinx.com:ip:processing_system7:5.5 \
 # ---------------------------------------------------------------------------
 
 # DDR3: SK Hynix H5TC4G63EFR-RDA (2片 × 4Gb ×16 = 1GB @ 32-bit)
-# PARTNO=MT41J256M16 RE-125 (注意 J 不是 K), SPEED_BIN=DDR3_1066F
+# The board has 1 GiB DDR3. This exact part selection is required so the PS7
+# address geometry matches the 1 GiB Pynq image and DMA buffers remain valid.
 # tRCD/tRP 单位是 cycles (非 ns), 值=7
 set_property -dict [list \
     CONFIG.PCW_UIPARAM_DDR_MEMORY_TYPE {DDR 3} \
-    CONFIG.PCW_UIPARAM_DDR_PARTNO {MT41J256M16 RE-125} \
+    CONFIG.PCW_UIPARAM_DDR_PARTNO {MT41K256M16 RE-125} \
     CONFIG.PCW_UIPARAM_DDR_BUS_WIDTH {32 Bit} \
     CONFIG.PCW_UIPARAM_DDR_SPEED_BIN {DDR3_1066F} \
     CONFIG.PCW_UIPARAM_DDR_DEVICE_CAPACITY {4096 MBits} \
@@ -156,7 +157,7 @@ set_property -dict [list \
     CONFIG.c_include_s2mm {0} \
     CONFIG.c_include_sg {0} \
     CONFIG.c_m_axi_mm2s_data_width {32} \
-    CONFIG.c_m_axis_mm2s_tdata_width {16} \
+    CONFIG.c_m_axis_mm2s_tdata_width {32} \
 ] $dma_A
 
 # DMA B: MM2S — PS DDR → 加速器 in_B
@@ -166,7 +167,7 @@ set_property -dict [list \
     CONFIG.c_include_s2mm {0} \
     CONFIG.c_include_sg {0} \
     CONFIG.c_m_axi_mm2s_data_width {32} \
-    CONFIG.c_m_axis_mm2s_tdata_width {16} \
+    CONFIG.c_m_axis_mm2s_tdata_width {32} \
 ] $dma_B
 
 # DMA C: S2MM — 加速器 out_C → PS DDR
@@ -177,7 +178,7 @@ set_property -dict [list \
     CONFIG.c_include_s2mm {1} \
     CONFIG.c_include_sg {0} \
     CONFIG.c_m_axi_s2mm_data_width {32} \
-    CONFIG.c_s_axis_s2mm_tdata_width {16} \
+    CONFIG.c_s_axis_s2mm_tdata_width {32} \
 ] $dma_C
 
 puts "\[INFO\] 3 个 DMA 配置完成"
@@ -260,7 +261,7 @@ connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK0] \
 # --- 关键: 关联 matmul_top 的 AXI 总线接口到 ap_clk ---
 # 没有这个, .hwh 不会记录时钟依赖, Pynq download() 不会使能 FCLK0 → PL 无时钟 → 挂死
 # ASSOCIATED_BUSIF 列出所有由 ap_clk 驱动的 AXI 总线接口名
-set_property CONFIG.ASSOCIATED_BUSIF {s_axi_control:in_A_V:in_B_V:out_C_V} \
+set_property CONFIG.ASSOCIATED_BUSIF {s_axi_control:in_A:in_B:out_C} \
     [get_bd_pins matmul_top_0/ap_clk]
 
 # --- 复位 ---
@@ -272,8 +273,19 @@ connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
                [get_bd_pins axi_dma_B/axi_resetn]
 connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
                [get_bd_pins axi_dma_C/axi_resetn]
+# AXI Interconnect: 全局 + 每个 master 口的复位都必须连
 connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
                [get_bd_pins axi_interconnect_0/ARESETN]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
+               [get_bd_pins axi_interconnect_0/S00_ARESETN]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
+               [get_bd_pins axi_interconnect_0/M00_ARESETN]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
+               [get_bd_pins axi_interconnect_0/M01_ARESETN]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
+               [get_bd_pins axi_interconnect_0/M02_ARESETN]
+connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
+               [get_bd_pins axi_interconnect_0/M03_ARESETN]
 connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
                [get_bd_pins smartconnect_0/aresetn]
 connect_bd_net [get_bd_pins rst_ps7_0/peripheral_aresetn] \
@@ -292,15 +304,14 @@ connect_bd_intf_net [get_bd_intf_pins axi_interconnect_0/M03_AXI] \
                      [get_bd_intf_pins axi_dma_C/S_AXI_LITE]
 
 # --- AXI Stream 数据通路 ---
-# 注: HLS RTL 的 AXIS 接口名带 _V 后缀 (in_A_V, in_B_V, out_C_V)
-# DMA_A → matmul_top.in_A_V
+# DMA_A → matmul_top.in_A
 connect_bd_intf_net [get_bd_intf_pins axi_dma_A/M_AXIS_MM2S] \
-                     [get_bd_intf_pins matmul_top_0/in_A_V]
-# DMA_B → matmul_top.in_B_V
+                     [get_bd_intf_pins matmul_top_0/in_A]
+# DMA_B → matmul_top.in_B
 connect_bd_intf_net [get_bd_intf_pins axi_dma_B/M_AXIS_MM2S] \
-                     [get_bd_intf_pins matmul_top_0/in_B_V]
-# matmul_top.out_C_V → DMA_C
-connect_bd_intf_net [get_bd_intf_pins matmul_top_0/out_C_V] \
+                     [get_bd_intf_pins matmul_top_0/in_B]
+# matmul_top.out_C → DMA_C; TLAST ends each 512-byte tile packet.
+connect_bd_intf_net [get_bd_intf_pins matmul_top_0/out_C] \
                      [get_bd_intf_pins axi_dma_C/S_AXIS_S2MM]
 
 # --- AXI Memory-Mapped: 3 个 DMA M_AXI → SmartConnect → HP0 ---
@@ -318,6 +329,14 @@ connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M00_AXI] \
 # ============================================================================
 assign_bd_address
 validate_bd_design
+
+# Set VALIDATE_ONLY=1 for a fast structural check without implementation.
+if {[info exists ::env(VALIDATE_ONLY)] && $::env(VALIDATE_ONLY) eq "1"} {
+    save_bd_design
+    puts "\[INFO\] VALIDATE_ONLY: block design is valid"
+    close_project
+    exit 0
+}
 
 puts "\[INFO\] Block Design 验证通过"
 

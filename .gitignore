@@ -10,6 +10,7 @@
 **/matmul_single/
 **/diag_test/
 **/systolic_accel/
+**/systolic_csim/
 **/systolic_diag/
 **/systolic_single/
 **/solution*/

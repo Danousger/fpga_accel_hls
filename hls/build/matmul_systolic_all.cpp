@@ -9,13 +9,15 @@
 // ============================================================================
 
 #include <ap_fixed.h>
+#include <ap_axi_sdata.h>
 #include <hls_stream.h>
 
 // ========================== 类型 & 常量 ==========================
 
 typedef ap_fixed<16, 8, AP_RND, AP_SAT>  data_t;
 typedef ap_fixed<48, 32, AP_RND, AP_SAT> acc_t;
-typedef hls::stream<data_t> data_stream;
+typedef ap_axis<32, 0, 0, 0> axis_word_t;
+typedef hls::stream<axis_word_t> data_stream;
 
 #define MAX_M   64
 #define MAX_N   64
@@ -114,13 +116,13 @@ void matmul_top(
     int          N,
     int          K
 ) {
-    #pragma HLS INTERFACE axis      port=in_A
-    #pragma HLS INTERFACE axis      port=in_B
-    #pragma HLS INTERFACE axis      port=out_C
-    #pragma HLS INTERFACE s_axilite port=M
-    #pragma HLS INTERFACE s_axilite port=N
-    #pragma HLS INTERFACE s_axilite port=K
-    #pragma HLS INTERFACE s_axilite port=return
+    #pragma HLS INTERFACE axis register both port=in_A
+    #pragma HLS INTERFACE axis register both port=in_B
+    #pragma HLS INTERFACE axis register both port=out_C
+    #pragma HLS INTERFACE s_axilite port=M bundle=control
+    #pragma HLS INTERFACE s_axilite port=N bundle=control
+    #pragma HLS INTERFACE s_axilite port=K bundle=control
+    #pragma HLS INTERFACE s_axilite port=return bundle=control
 
     data_t A_buf[TILE_M][TILE_K];
     data_t B_buf[TILE_K][TILE_N];
@@ -150,14 +152,20 @@ void matmul_top(
                 for (int i = 0; i < 16; i++) {
                     for (int k = 0; k < 16; k++) {
                         #pragma HLS PIPELINE II=1
-                        in_A >> A_buf[i][k];
+                        axis_word_t word = in_A.read();
+                        data_t value;
+                        value.range(15, 0) = word.data.range(15, 0);
+                        A_buf[i][k] = value;
                     }
                 }
                 // 加载 B_tile
                 for (int k = 0; k < 16; k++) {
                     for (int j = 0; j < 16; j++) {
                         #pragma HLS PIPELINE II=1
-                        in_B >> B_buf[k][j];
+                        axis_word_t word = in_B.read();
+                        data_t value;
+                        value.range(15, 0) = word.data.range(15, 0);
+                        B_buf[k][j] = value;
                     }
                 }
                 // 脉动阵列计算
@@ -168,7 +176,15 @@ void matmul_top(
             for (int i = 0; i < 16; i++) {
                 for (int j = 0; j < 16; j++) {
                     #pragma HLS PIPELINE II=1
-                    out_C << (data_t)C_buf[i][j];
+                    data_t value = (data_t)C_buf[i][j];
+                    axis_word_t word;
+                    ap_int<16> raw = value.range(15, 0);
+                    ap_int<32> extended = raw;
+                    word.data = extended;
+                    word.keep = -1;
+                    word.strb = -1;
+                    word.last = (i == 15 && j == 15) ? 1 : 0;
+                    out_C.write(word);
                 }
             }
         }
